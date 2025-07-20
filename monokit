@@ -1,0 +1,506 @@
+#!/bin/bash
+
+set -e
+
+# Capture the script directory for sourcing other scripts
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+COMMAND=$1
+TARGET=$2
+TYPE=$3
+MODE=$4
+
+# Config
+ORG_NAME="@myorg"
+
+# Helpers
+error() {
+  echo "❌ $1"
+  exit 1
+}
+
+success() {
+  echo "✅ $1"
+}
+
+get_package_path() {
+  if [[ "$TYPE" == "app" ]]; then
+    echo "apps/$TARGET/package.json"
+  elif [[ "$TYPE" == "lib" ]]; then
+    echo "packages/$TARGET/package.json"
+  else
+    error "Unknown type: $TYPE"
+  fi
+}
+
+switch_to_local() {
+  PKG_PATH=$(get_package_path)
+  if [ ! -f "$PKG_PATH" ]; then error "Package file not found: $PKG_PATH"; fi
+
+  TMP=$(mktemp)
+  jq "if .dependencies then .dependencies |= with_entries(
+        if .key | startswith(\"$ORG_NAME/\") then .value = \"workspace:*\" else . end
+      ) else . end" "$PKG_PATH" > "$TMP" && mv "$TMP" "$PKG_PATH"
+
+  success "Switched $TARGET ($TYPE) dependencies to workspace:*"
+}
+
+switch_to_remote() {
+  PKG_PATH=$(get_package_path)
+  if [ ! -f "$PKG_PATH" ]; then error "Package file not found: $PKG_PATH"; fi
+
+  TMP=$(mktemp)
+  jq "if .dependencies then .dependencies |= with_entries(
+        if .key | startswith(\"$ORG_NAME/\") then .value = \"^0.1.0\" else . end
+      ) else . end" "$PKG_PATH" > "$TMP" && mv "$TMP" "$PKG_PATH"
+
+  success "Switched $TARGET ($TYPE) dependencies to ^0.1.0"
+}
+
+init_project() {
+  REPO_NAME=$2
+  if [ -z "$REPO_NAME" ]; then error "Please provide a repo name: ./core-script.sh init my-repo"; fi
+
+  echo "🚀 Initializing monorepo: $REPO_NAME"
+  mkdir "$REPO_NAME"
+  cd "$REPO_NAME"
+  git init
+  pnpm init 
+
+  mkdir -p apps packages .github/workflows
+
+  cat > package.json <<EOL
+{
+  "name": "$REPO_NAME",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "pnpm -r build",
+    "dev": "pnpm -r dev",
+    "lint": "pnpm -r lint",
+    "format": "pnpm -r format",
+    "test": "pnpm -r test",
+    "test:ui": "pnpm -r test:ui",
+    "clean": "pnpm -r clean",
+    "type-check": "pnpm -r type-check",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "release": "pnpm build && changeset publish"
+  }
+}
+EOL
+
+  # Create pnpm-workspace.yaml instead of using workspaces field
+  cat > pnpm-workspace.yaml <<EOL
+packages:
+  - 'apps/*'
+  - 'packages/*'
+EOL
+
+  cat > tsconfig.base.json <<EOL
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "declaration": true,
+    "outDir": "dist",
+    "strict": true,
+    "esModuleInterop": true,
+    "moduleResolution": "node",
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true
+  }
+}
+EOL
+
+  cat > .gitignore <<EOL
+node_modules/
+dist/
+coverage/
+.env
+.DS_Store
+.changeset/
+EOL
+
+  # Install dependencies without workspace-root flag during initialization
+  pnpm add -w -D typescript tsup vitest @vitest/ui eslint prettier \
+    eslint-config-prettier eslint-plugin-import @typescript-eslint/parser \
+    @typescript-eslint/eslint-plugin @types/node @changesets/cli \
+    @eslint/js
+
+  # Create ESLint configuration
+  cat > eslint.config.js <<EOL
+import js from '@eslint/js'
+import typescript from '@typescript-eslint/eslint-plugin'
+import typescriptParser from '@typescript-eslint/parser'
+import prettier from 'eslint-config-prettier'
+import importPlugin from 'eslint-plugin-import'
+
+export default [
+  js.configs.recommended,
+  {
+    files: ['**/*.ts', '**/*.tsx'],
+    languageOptions: {
+      parser: typescriptParser,
+      parserOptions: {
+        ecmaVersion: 'latest',
+        sourceType: 'module',
+      },
+    },
+    plugins: {
+      '@typescript-eslint': typescript,
+      import: importPlugin,
+    },
+    rules: {
+      ...typescript.configs.recommended.rules,
+      'import/order': [
+        'error',
+        {
+          groups: [
+            'builtin',
+            'external',
+            'internal',
+            'parent',
+            'sibling',
+            'index',
+          ],
+          'newlines-between': 'always',
+          alphabetize: {
+            order: 'asc',
+            caseInsensitive: true,
+          },
+        },
+      ],
+    },
+  },
+  {
+    ignores: [
+      'node_modules/**',
+      'dist/**',
+      'packages/*/dist/**',
+      'apps/*/dist/**',
+    ],
+  },
+  prettier,
+]
+EOL
+
+  # Create Prettier configuration
+  cat > .prettierrc <<EOL
+{
+  "semi": true,
+  "trailingComma": "es5",
+  "singleQuote": true,
+  "printWidth": 80,
+  "tabWidth": 2
+}
+EOL
+
+  pnpm exec changeset init
+
+  # Source helper scripts from the original directory
+  source "$SCRIPT_DIR/monokit-files/readme.sh"
+  source "$SCRIPT_DIR/monokit-files/github-actions.sh"
+
+  generate_readme "$REPO_NAME"
+  setup_github_actions
+  success "Monorepo initialized: $REPO_NAME"
+}
+
+# Helper function to add scripts to root package.json for a new package
+add_package_scripts_to_root() {
+  local PKG_NAME=$1
+  local PKG_TYPE=$2
+  
+  if [ ! -f "package.json" ]; then
+    error "Root package.json not found. Run this from the monorepo root."
+  fi
+  
+  # Create temporary file for jq operations
+  TMP=$(mktemp)
+  
+  # Add individual package scripts to root package.json using shell variables
+  jq --arg pkg "$PKG_NAME" --arg build_cmd "pnpm --filter $PKG_NAME build" \
+     --arg dev_cmd "pnpm --filter $PKG_NAME dev" \
+     --arg lint_cmd "pnpm --filter $PKG_NAME lint" \
+     --arg format_cmd "pnpm --filter $PKG_NAME format" \
+     --arg test_cmd "pnpm --filter $PKG_NAME test" \
+     --arg test_ui_cmd "pnpm --filter $PKG_NAME test:ui" \
+     --arg clean_cmd "pnpm --filter $PKG_NAME clean" \
+     --arg type_check_cmd "pnpm --filter $PKG_NAME type-check" '
+    .scripts += {
+      ($pkg + ":build"): $build_cmd,
+      ($pkg + ":dev"): $dev_cmd,
+      ($pkg + ":lint"): $lint_cmd,
+      ($pkg + ":format"): $format_cmd,
+      ($pkg + ":test"): $test_cmd,
+      ($pkg + ":test:ui"): $test_ui_cmd,
+      ($pkg + ":clean"): $clean_cmd,
+      ($pkg + ":type-check"): $type_check_cmd
+    }
+  ' package.json > "$TMP" && mv "$TMP" package.json
+  
+  success "Added scripts for $PKG_NAME to root package.json"
+}
+
+# Helper function to sanitize package names for TypeScript
+sanitize_for_typescript() {
+  local name=$1
+  # Convert kebab-case to camelCase
+  echo "$name" | sed 's/-\([a-z]\)/\U\1/g'
+}
+
+# Help function
+show_help() {
+  echo "🚀 Monokit - TypeScript Monorepo Management Tool"
+  echo "================================================"
+  echo
+  echo "Usage: monokit <command> [options]"
+  echo
+  echo "Commands:"
+  echo "  init <project-name>           Initialize a new monorepo"
+  echo "  add lib <name>                Add a new library"
+  echo "  add app <name>                Add a new application"
+  echo "  switch <pkg> <type> <mode>   Switch dependencies (local/remote)"
+  echo "  help, --help, -h             Show this help message"
+  echo
+  echo "Examples:"
+  echo "  monokit init my-project"
+  echo "  monokit add lib utils"
+  echo "  monokit add app web-app"
+  echo "  monokit switch utils lib local"
+  echo
+  echo "For more information, visit: https://github.com/your-username/monokit"
+}
+
+add_lib() {
+  LIB_NAME=$3
+  if [ -z "$LIB_NAME" ]; then
+    error "Usage: ./core-script.sh add lib <lib-name>"
+  fi
+
+  # Check if we're in a workspace by looking for pnpm-workspace.yaml
+  if [ -f "pnpm-workspace.yaml" ]; then
+    DEST="packages/$LIB_NAME"
+  else
+    error "Not in a workspace. Run this command from within a monorepo directory."
+  fi
+
+  PKG_NAME="@myorg/$LIB_NAME"
+  TS_NAME=$(sanitize_for_typescript "$LIB_NAME")
+
+  if [ -d "$DEST" ]; then
+    error "Library already exists: $DEST"
+  fi
+
+  echo "📦 Creating new library: $PKG_NAME"
+  mkdir -p "$DEST/src"
+
+  # package.json with comprehensive scripts
+  cat > "$DEST/package.json" <<EOL
+{
+  "name": "$PKG_NAME",
+  "version": "0.0.1",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsup src/index.ts --dts --format esm,cjs",
+    "watch": "tsup src/index.ts --watch",
+    "dev": "tsup src/index.ts --watch --onSuccess \\"node dist/index.js\\"",
+    "lint": "eslint . --ext .ts --config ../../eslint.config.js",
+    "format": "prettier --write .",
+    "test": "vitest run",
+    "test:ui": "vitest --ui",
+    "clean": "rm -rf dist",
+    "type-check": "tsc --noEmit"
+  }
+}
+EOL
+
+  # tsconfig.json
+  cat > "$DEST/tsconfig.json" <<EOL
+{
+  "extends": "../../tsconfig.base.json",
+  "include": ["src"]
+}
+EOL
+
+  # vitest.config.ts
+  cat > "$DEST/vitest.config.ts" <<EOL
+import { defineConfig } from 'vitest/config';
+export default defineConfig({ test: { globals: true, environment: 'node' } });
+EOL
+
+  # Initial source file with sanitized name
+  cat > "$DEST/src/index.ts" <<EOL
+/**
+ * Adds two numbers together
+ * @param a - First number
+ * @param b - Second number
+ * @returns The sum of a and b
+ */
+export const add = (a: number, b: number): number => {
+  return a + b;
+};
+
+/**
+ * Greets a person by name
+ * @param name - The name to greet
+ * @returns A greeting message
+ */
+export const greet = (name: string): string => {
+  return \`Hello, \${name}!\`;
+};
+
+export const $TS_NAME = () => {
+  return "$PKG_NAME";
+};
+EOL
+
+  # Create test folder and test file
+  mkdir -p "$DEST/src/__tests__"
+  cat > "$DEST/src/__tests__/index.test.ts" <<EOL
+import { describe, it, expect } from 'vitest';
+import { add, greet, $TS_NAME } from '../index';
+
+describe('$TS_NAME', () => {
+  describe('add', () => {
+    it('should add two positive numbers', () => {
+      expect(add(2, 3)).toBe(5);
+    });
+
+    it('should add negative numbers', () => {
+      expect(add(-1, -2)).toBe(-3);
+    });
+
+    it('should add zero', () => {
+      expect(add(5, 0)).toBe(5);
+    });
+  });
+
+  describe('greet', () => {
+    it('should greet a person by name', () => {
+      expect(greet('Alice')).toBe('Hello, Alice!');
+    });
+
+    it('should handle empty string', () => {
+      expect(greet('')).toBe('Hello, !');
+    });
+  });
+
+  describe('$TS_NAME', () => {
+    it('should return the package name', () => {
+      expect($TS_NAME()).toBe('$PKG_NAME');
+    });
+  });
+});
+EOL
+
+  # Add scripts to root package.json
+  add_package_scripts_to_root "$PKG_NAME" "lib"
+
+  success "Library '$PKG_NAME' created in $DEST"
+}
+
+add_app() {
+  APP_NAME=$3
+  if [ -z "$APP_NAME" ]; then
+    error "Usage: ./core-script.sh add app <app-name>"
+  fi
+
+  # Check if we're in a workspace by looking for pnpm-workspace.yaml
+  if [ -f "pnpm-workspace.yaml" ]; then
+    DEST="apps/$APP_NAME"
+  else
+    error "Not in a workspace. Run this command from within a monorepo directory."
+  fi
+
+  PKG_NAME="@myorg/$APP_NAME"
+  TS_NAME=$(sanitize_for_typescript "$APP_NAME")
+
+  if [ -d "$DEST" ]; then
+    error "App already exists: $DEST"
+  fi
+
+  echo "🧠 What type of app is '$APP_NAME'?"
+  echo "1) CLI"
+  echo "2) API (Express)"
+  echo "3) Web (Vite + React)"
+  echo "4) Web (Next.js)"
+  echo -n "Enter choice [1-4]: "
+  read APP_TYPE
+
+  mkdir -p "$DEST/src"
+
+  # Source the modular app creation scripts
+  source "$SCRIPT_DIR/monokit-files/cli-app.sh"
+  source "$SCRIPT_DIR/monokit-files/express-app.sh"
+  source "$SCRIPT_DIR/monokit-files/vite-app.sh"
+  source "$SCRIPT_DIR/monokit-files/nextjs-app.sh"
+
+  case "$APP_TYPE" in
+    1)
+      create_cli_app "$DEST" "$PKG_NAME" "$TS_NAME"
+      ;;
+    2)
+      create_express_app "$DEST" "$PKG_NAME" "$TS_NAME"
+      ;;
+    3)
+      create_vite_app "$DEST" "$PKG_NAME" "$TS_NAME"
+      ;;
+    4)
+      create_nextjs_app "$DEST" "$PKG_NAME" "$TS_NAME"
+      ;;
+    *)
+      error "Invalid app type selection. Please choose 1-4."
+      ;;
+  esac
+
+  # Add scripts to root package.json
+  add_package_scripts_to_root "$PKG_NAME" "app"
+
+  success "App '$APP_NAME' created at $DEST"
+}
+
+
+
+# Main command dispatcher
+case "$COMMAND" in
+  init)
+    init_project "$@"
+    ;;
+  switch)
+    if [ -z "$TARGET" ] || [ -z "$TYPE" ] || [ -z "$MODE" ]; then
+      error "Usage: monokit switch <target> <app|lib> <local|remote>"
+    fi
+    if [[ "$MODE" == "local" ]]; then
+      switch_to_local
+    elif [[ "$MODE" == "remote" ]]; then
+      switch_to_remote
+    else
+      error "Unknown mode: $MODE"
+    fi
+    ;;
+  add)
+    if [[ "$2" == "lib" ]]; then
+      add_lib "$@"
+     elif [[ "$2" == "app" ]]; then
+      add_app "$@"
+    else
+      error "Usage: monokit add lib|app <name>"
+    fi
+    ;;
+  help|--help|-h)
+    show_help
+    ;;
+  "")
+    show_help
+    ;;
+  *)
+    error "Unknown command: $COMMAND"
+    echo "Run 'monokit help' for usage information."
+    ;;
+esac
+
+
