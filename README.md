@@ -45,7 +45,7 @@ npx monokit init my-project
 #### Option 2: Direct Download
 ```bash
 # Download the monokit script
-curl -fsSL https://raw.githubusercontent.com/your-username/monokit/main/monokit -o monokit
+curl -fsSL https://raw.githubusercontent.com/logimos/monokit/main/monokit -o monokit
 
 # Make it executable
 chmod +x monokit
@@ -57,7 +57,7 @@ sudo mv monokit /usr/local/bin/
 #### Option 3: Clone and Install
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/monokit.git
+git clone https://github.com/logimos/monokit.git
 cd monokit
 
 # Make executable
@@ -295,7 +295,7 @@ pnpm add --filter "$PKG_NAME" your-preferred-cli-lib
 
 ### Getting Help
 
-1. Check the [Issues](https://github.com/your-username/monokit/issues) page
+1. Check the [Issues](https://github.com/logimos/monokit/issues) page
 2. Create a new issue with:
    - Your operating system
    - Node.js and PNPM versions
